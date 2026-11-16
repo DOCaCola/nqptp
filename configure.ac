@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
-AC_INIT([nqptp], [1.2.8], [4265913+mikebrady@users.noreply.github.com])
+AC_INIT([nqptp], [1.2.9], [4265913+mikebrady@users.noreply.github.com])
 : ${CFLAGS="-O3"}
 : ${CXXFLAGS="-O3"}
 AM_INIT_AUTOMAKE
@@ -12,6 +12,7 @@ build_linux=no
 build_freebsd=no
 build_openbsd=no
 build_mingw=no
+build_darwin=no
 
 # Detect the target system
 case "${host_os}" in
@@ -27,6 +28,9 @@ case "${host_os}" in
     mingw*)
         build_mingw=yes
         ;;
+    darwin*)
+        build_darwin=yes
+        ;;
     *)
         AC_MSG_ERROR(["OS $host_os is not supported"])
         ;;
@@ -37,6 +41,7 @@ AM_CONDITIONAL([BUILD_FOR_LINUX], [test "$build_linux" = "yes"])
 AM_CONDITIONAL([BUILD_FOR_FREEBSD], [test "$build_freebsd" = "yes"])
 AM_CONDITIONAL([BUILD_FOR_OPENBSD], [test "$build_openbsd" = "yes"])
 AM_CONDITIONAL([BUILD_FOR_MINGW], [test "$build_mingw" = "yes"])
+AM_CONDITIONAL([BUILD_FOR_DARWIN], [test "$build_darwin" = "yes"])
 
 if test "x$build_linux" = "xyes" ; then
   AC_DEFINE([CONFIG_FOR_LINUX], 1, [Build for Linux.])
@@ -50,6 +55,9 @@ fi
 if test "x$build_mingw" = "xyes" ; then
   AC_DEFINE([CONFIG_FOR_MINGW], 1, [Build for MinGW.])
   LIBS="-lws2_32 -liphlpapi ${LIBS}"
+fi
+if test "x$build_darwin" = "xyes" ; then
+  AC_DEFINE([CONFIG_FOR_DARWIN], 1, [Build for macOS.])
 fi
 
 AC_CHECK_PROGS([GIT], [git])

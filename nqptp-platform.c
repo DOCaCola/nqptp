@@ -106,6 +106,7 @@ int nqptp_get_device_id(uint8_t *id, int *int_length) {
 }
 
 #else
+#include "general-utilities.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -135,10 +136,12 @@ int nqptp_socket_error(void) { return errno; }
 int nqptp_socket_would_block(int error) { return error == EAGAIN; }
 
 struct shm_structure *nqptp_shared_memory_create(const char *name, size_t size, int locked) {
+  mode_t oldumask = umask(0);
   int shm_fd = shm_open(name, O_RDWR | O_CREAT, 0666);
+  (void)umask(oldumask);
   if (shm_fd == -1)
     return (struct shm_structure *)-1;
-  if (ftruncate(shm_fd, size) == -1) {
+  if (shm_ftruncate(shm_fd, size) == -1) {
     close(shm_fd);
     return (struct shm_structure *)-1;
   }

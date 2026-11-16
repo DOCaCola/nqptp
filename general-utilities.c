@@ -23,6 +23,8 @@
 #include <arpa/inet.h> // ntohl etc.
 #endif
 #include <string.h>    // memcpy
+#include <sys/stat.h>  // fstat
+#include <unistd.h>    // ftruncate
 
 void hcton64(uint64_t num, uint8_t *p) {
   uint64_t numc = num;
@@ -79,6 +81,7 @@ uint64_t timespec_to_ns(struct timespec *tn) {
   return tnfpsec + tnfpnsec;
 }
 
+/*
 uint64_t get_time_now() {
   struct timespec tn;
 #ifdef CLOCK_MONOTONIC_RAW
@@ -87,4 +90,23 @@ uint64_t get_time_now() {
   clock_gettime(CLOCK_MONOTONIC, &tn);
 #endif
   return timespec_to_ns(&tn);
+}
+*/
+uint64_t get_time_now() {
+  struct timespec tn;
+#if defined(CONFIG_FOR_DARWIN)
+  clock_gettime(CLOCK_UPTIME_RAW, &tn);
+#elif defined(CLOCK_MONOTONIC_RAW)
+  clock_gettime(CLOCK_MONOTONIC_RAW, &tn);
+#else
+  clock_gettime(CLOCK_MONOTONIC, &tn);
+#endif
+  return (uint64_t)tn.tv_sec * 1000000000u + (uint64_t)tn.tv_nsec;
+}
+
+int shm_ftruncate(int fd, off_t length) {
+  struct stat st;
+  if ((fstat(fd, &st) == 0) && (st.st_size >= length))
+    return 0;
+  return ftruncate(fd, length);
 }

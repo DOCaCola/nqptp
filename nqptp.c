@@ -57,7 +57,7 @@
 #include <sys/socket.h>
 #endif
 
-#if defined(CONFIG_FOR_FREEBSD) || defined(CONFIG_FOR_OPENBSD)
+#if defined(CONFIG_FOR_FREEBSD) || defined(CONFIG_FOR_OPENBSD) || defined(CONFIG_FOR_DARWIN)
 #include <netinet/in.h>
 #include <sys/socket.h>
 #endif
@@ -66,6 +66,31 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <pwd.h>
+#endif
+
+#if defined(CONFIG_FOR_DARWIN) && defined(SO_TIMESTAMP_MONOTONIC) && defined(SCM_TIMESTAMP_MONOTONIC)
+#include <mach/mach_time.h>
+#define NQPTP_KERNEL_RX_STAMPS 1
+
+// Returns the kernel's arrival stamp in ns on get_time_now()'s clock
+// (CLOCK_UPTIME_RAW == mach_absolute_time), or 0 if there isn't a usable one.
+static uint64_t kernel_rx_time(struct msghdr *m) {
+  static mach_timebase_info_data_t tb;
+  if (tb.denom == 0)
+    mach_timebase_info(&tb);
+  if (m->msg_flags & MSG_CTRUNC)
+    return 0;
+  for (struct cmsghdr *c = CMSG_FIRSTHDR(m); c; c = CMSG_NXTHDR(m, c)) {
+    if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMP_MONOTONIC &&
+        c->cmsg_len >= CMSG_LEN(sizeof(uint64_t))) {
+      uint64_t ticks;
+      memcpy(&ticks, CMSG_DATA(c), sizeof ticks);
+      uint64_t t = ticks * tb.numer / tb.denom;
+      return (t <= get_time_now()) ? t : 0; // a stamp can't be in the future
+    }
+  }
+  return 0;
+}
 #endif
 
 #ifndef FIELD_SIZEOF
@@ -105,20 +130,13 @@ void goodbye(void) {
   for (i = 0; i < sockets_open_stuff.sockets_open; i++)
     nqptp_socket_close(&sockets_open_stuff.sockets[i].number);
 
-  // close off shared memory interface
+  // unmap and unlink every client's own shared memory interface. There is no
+  // separate daemon-wide region any more -- a client that uses the default
+  // name simply gets a client record called NQPTP_INTERFACE_NAME.
   delete_clients();
 
-  // close off new smi
-  // mmap cleanup
-  if (nqptp_shared_memory_unmap(shared_memory, sizeof(struct shm_structure)) != 0) {
-    debug(1, "error unmapping shared memory \"%s\": \"%s\".", NQPTP_INTERFACE_NAME,
-          strerror(errno));
-  }
-  // shm_open cleanup
-  if (nqptp_shared_memory_unlink(NQPTP_INTERFACE_NAME) == -1) {
-    debug(1, "error unlinking shared memory \"%s\": \"%s\".", NQPTP_INTERFACE_NAME,
-          strerror(errno));
-  }
+  if (epoll_fd != -1)
+    close(epoll_fd);
 
   nqptp_platform_cleanup();
 
@@ -196,12 +214,15 @@ int main(int argc, char **argv) {
   
   
   // try to set a real time scheduling policy with a priority of -6
+  // but not on macOS
+#ifndef CONFIG_FOR_DARWIN
   int policy = SCHED_FIFO;
   struct sched_param param;
   param.sched_priority = 5;
   int s = pthread_setschedparam(pthread_self(), policy, &param);
   if (s != 0)
     debug(1, "pthread_setschedparam failed:  %d -- \"%s\".", s, strerror(s));
+#endif
  
   sockets_open_stuff.sockets_open = 0;
 
@@ -248,17 +269,16 @@ int main(int argc, char **argv) {
   }
 #endif
 
-  // open the SMI
-
-  shared_memory = nqptp_shared_memory_create(NQPTP_INTERFACE_NAME, sizeof(struct shm_structure), 1);
-
-  if (shared_memory == (struct shm_structure *)-1) {
-    die("failed to mmap shared memory \"%s\".", NQPTP_INTERFACE_NAME);
-  }
-
-  // zero it
-  memset(shared_memory, 0, sizeof(struct shm_structure));
-  shared_memory->version = NQPTP_SHM_STRUCTURES_VERSION;
+  // No shared memory interface is created here any more. Each client's SMI is
+  // created on demand by get_client_id() when that client first sends a control
+  // message naming it -- which every client already does, and which is exactly
+  // what shairport-sync's initial "T" is for. A single client using the default
+  // name gets a region called NQPTP_INTERFACE_NAME, so single-instance
+  // behaviour is unchanged.
+  //
+  // Note this also removes the "is another copy of nqptp running already?"
+  // check that creating the fixed region used to provide; binding the control
+  // port below is now the only thing that detects a second daemon.
 
   ssize_t recv_len;
 
@@ -272,7 +292,7 @@ int main(int argc, char **argv) {
   uint64_t broadcasting_task(uint64_t call_time, void *private_data);
 
   timed_tasks[0].trigger_time = get_time_now() + 100000000; // start after 100 ms
-  timed_tasks[0].private_data = (void *)&clocks_private;
+  timed_tasks[0].private_data = NULL; // broadcasting_task walks every client itself
   timed_tasks[0].task = broadcasting_task;
 
   // now, get down to business
@@ -309,6 +329,7 @@ int main(int argc, char **argv) {
             SOCKADDR from_sock_addr;
             memset(&from_sock_addr, 0, sizeof(SOCKADDR));
 
+            uint64_t packet_time = reception_time; // if we can't do better...
 #ifdef CONFIG_FOR_MINGW
             int from_sock_addr_len = sizeof(from_sock_addr);
             recv_len = recvfrom(socket_number, buf, BUFLEN, 0, (struct sockaddr *)&from_sock_addr,
@@ -351,6 +372,23 @@ int main(int argc, char **argv) {
                 if (socket_number == sockets_open_stuff.sockets[jp].number)
                   receiver_port = sockets_open_stuff.sockets[jp].port;
               }
+// This is for Darwin/macOS, which supplies the kernel reception time of a packet, and we use it instead of the lass-precise "reception time", which is really the time after the call thread has resumed having received the packet.
+#ifdef NQPTP_KERNEL_RX_STAMPS
+              if (receiver_port == 319 || receiver_port == 320) {
+                uint64_t k = kernel_rx_time(&msg);
+                if (k != 0) {
+                  packet_time = k;
+                  if ((int64_t)(reception_time - packet_time) > 150000)
+                    debug(3, "actual packet reception time difference from so-called reception time: %g ms.", (int64_t)(reception_time - packet_time) * 1E-6);
+                } else {
+                  static int warned = 0;
+                  if (!warned) {
+                    warned = 1;
+                    debug(1, "no kernel receive timestamp; using select() time.");
+                  }
+                }
+              }
+#endif
             }
             if (recv_len == -1) {
               int socket_error = nqptp_socket_error();
@@ -362,10 +400,8 @@ int main(int argc, char **argv) {
               // check if it's a control port message before checking for the length of the
               // message.
             } else if (receiver_port == NQPTP_CONTROL_PORT) {
-              handle_control_port_messages(
-                  buf, recv_len, (clock_source_private_data *)&clocks_private, reception_time);
+              handle_control_port_messages(buf, recv_len, packet_time);
             } else if (recv_len >= (ssize_t)sizeof(struct ptp_common_message_header)) {
-              debug_print_buffer(2, buf, recv_len);
 
               // check its credentials
               // the sending and receiving ports must be the same (i.e. 319 -> 319 or 320 -> 320)
@@ -394,36 +430,40 @@ int main(int argc, char **argv) {
                 char sender_string[256];
                 memset(sender_string, 0, sizeof(sender_string));
                 inet_ntop(connection_ip_family, sender_addr, sender_string, sizeof(sender_string));
-                // now, find the record for this ip
-                int the_clock = find_clock_source_record(
-                    sender_string, (clock_source_private_data *)&clocks_private);
-                // not sure about requiring a Sync before creating it...
-                // if ((the_clock == -1) && ((buf[0] & 0xF) == Sync)) {
-                /*
-                if (the_clock == -1) {
-                  the_clock = create_clock_source_record(
-                      sender_string, (clock_source_private_data *)&clocks_private);
+                // One packet on the wire can be relevant to several clients: the
+                // same sender may be in more than one client's timing peer
+                // group. Offer it to every client that is monitoring this IP,
+                // and let each keep its own smoothing state. A client that has
+                // never heard of this IP is left completely untouched -- that
+                // isolation is the point of the whole exercise.
+                int client_id;
+                for (client_id = 0; client_id < MAX_CLIENTS; client_id++) {
+                  if (client_is_in_use(client_id) == 0)
+                    continue;
+                  clock_source_private_data *clocks_private = clients[client_id].clocks_private;
+                  int the_clock = find_clock_source_record(sender_string, clocks_private);
+                  if (the_clock != -1) {
+                    clocks_private[the_clock].time_of_last_use =
+                        packet_time; // for garbage collection
+                    // debug_print_buffer(1, sender_string, buf, recv_len); 
+                    switch (buf[0] & 0xF) {
+                    case Announce:
+                      handle_announce(buf, recv_len, &clocks_private[the_clock], packet_time);
+                      break;
+                    case Follow_Up:
+                      handle_follow_up(buf, recv_len, &clocks_private[the_clock], client_id,
+                                       packet_time);
+                      break;
+                    case Sync:
+                      handle_sync(buf, recv_len, &clocks_private[the_clock], packet_time);
+                      break;
+                    default:
+                      debug_print_buffer(2, sender_string, buf,
+                                         recv_len); // unusual messages will have debug level 1.
+                      break;
+                    }
+                  } // otherwise, just forget it for this client
                 }
-                */
-                if (the_clock != -1) {
-                  clocks_private[the_clock].time_of_last_use =
-                      reception_time; // for garbage collection
-                  switch (buf[0] & 0xF) {
-                  case Announce:
-                    handle_announce(buf, recv_len, &clocks_private[the_clock], reception_time);
-                    break;
-                  case Follow_Up:
-                    handle_follow_up(buf, recv_len, &clocks_private[the_clock], reception_time);
-                    break;
-                  case Sync:
-                    handle_sync(buf, recv_len, &clocks_private[the_clock], reception_time);
-                    break;
-                  default:
-                    debug_print_buffer(2, buf,
-                                       recv_len); // unusual messages will have debug level 1.
-                    break;
-                  }
-                } // otherwise, just forget it
               }
             }
           }
@@ -511,8 +551,6 @@ void send_awakening_announcement_sequence(const uint64_t clock_id, const char *c
       debug(1, "failed to resolve remote socket address (err=%d)", err);
     } else {
       // here, we have the destination, so send it
-
-      // debug_print_buffer(1, (char *)msg, msg_length);
       int ret = sendto(s, (const char *)msg, msg_length, 0, res->ai_addr, res->ai_addrlen);
       if (ret == -1)
         debug(1, "result of sendto is %d.", ret);
@@ -540,42 +578,40 @@ void send_awakening_announcement_sequence(const uint64_t clock_id, const char *c
 }
 
 uint64_t broadcasting_task(uint64_t call_time, __attribute__((unused)) void *private_data) {
-  clock_source_private_data *clocks_private = (clock_source_private_data *)private_data;
-  int i;
-  for (i = 0; i < MAX_CLOCKS; i++) {
+  // Every client's clock table is swept: a silent clock is a per-client
+  // condition now, since two clients can be watching the same IP and only one
+  // of them may have stopped hearing from it.
+  int client_id;
+  for (client_id = 0; client_id < MAX_CLIENTS; client_id++) {
+    if (client_is_in_use(client_id) == 0)
+      continue;
+    clock_source_private_data *clocks_private = clients[client_id].clocks_private;
+    int i;
+    for (i = 0; i < MAX_CLOCKS; i++) {
+      if (clocks_private[i].announcements_without_followups == 3) {
+        if (clocks_private[i].follow_up_number == 0) {
+          debug(1,
+                "Attempt to awaken a silent clock %" PRIx64
+                ", index %u, at follow_up_number %u at IP %s for client \"%s\".",
+                clocks_private[i].clock_id, i, clocks_private[i].follow_up_number,
+                clocks_private[i].ip, get_client_name(client_id));
 
-    /*
-        int is_a_master = 0;
-        int temp_client_id;
+          // send an Announce message to attempt to waken this silent PTP clock by
+          // getting it to negotiate with an apparently better clock
+          // that then immediately sends another Announce message indicating that it's inferior
 
-        for (temp_client_id = 0; temp_client_id < MAX_CLIENTS; temp_client_id++)
-          if ((clocks_private->client_flags[temp_client_id] & (1 << clock_is_master)) != 0)
-            is_a_master = 1;
-        // only process it if it's a master somewhere...
-        if ((is_a_master != 0) && (clocks_private[i].announcements_without_followups == 3)) {
-    */
-    if (clocks_private[i].announcements_without_followups == 3) {
-      if (clocks_private[i].follow_up_number == 0) {
-        debug(1,
-              "Attempt to awaken a silent clock %" PRIx64
-              ", index %u, at follow_up_number %u at IP %s.",
-              clocks_private[i].clock_id, i, clocks_private[i].follow_up_number,
-              clocks_private[i].ip);
-
-        // send an Announce message to attempt to waken this silent PTP clock by
-        // getting it to negotiate with an apparently better clock
-        // that then immediately sends another Announce message indicating that it's inferior
-
-        clocks_private[i].announcements_without_followups++; // set to 4 to indicate done/parked
-        send_awakening_announcement_sequence(
-            clocks_private[i].clock_id, clocks_private[i].ip, clocks_private[i].family,
-            clocks_private[i].grandmasterPriority1, clocks_private[i].grandmasterPriority2);
-      } else {
-        debug(1,
-              "Silent clock %" PRIx64
-              " detected, index %u, at follow_up_number %u at IP %s. No attempt to awaken it.",
-              clocks_private[i].clock_id, i, clocks_private[i].follow_up_number,
-              clocks_private[i].ip);
+          clocks_private[i].announcements_without_followups++; // set to 4 to indicate done/parked
+          send_awakening_announcement_sequence(
+              clocks_private[i].clock_id, clocks_private[i].ip, clocks_private[i].family,
+              clocks_private[i].grandmasterPriority1, clocks_private[i].grandmasterPriority2);
+        } else {
+          debug(3,
+                "Silent clock %" PRIx64
+                " detected, index %u, at follow_up_number %u at IP %s for client \"%s\". No "
+                "attempt to awaken it.",
+                clocks_private[i].clock_id, i, clocks_private[i].follow_up_number,
+                clocks_private[i].ip, get_client_name(client_id));
+        }
       }
     }
   }
